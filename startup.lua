@@ -1,259 +1,238 @@
-local sensor = peripheral.find("gimbal_sensor")
+local sensor   = peripheral.find("integrated_flight_sensor")
+local thruster = peripheral.find("liquid_vector_thruster")
+local backpack = peripheral.find("sophisticatedbackpacks:backpack")
+local bus      = peripheral.find("multi_channel_cable_bus")
 
-local redstone_1 = peripheral.wrap("redstone_relay_4")
+if not sensor or not thruster then error("Sensor or Thruster not found!") end
+local bpName = backpack and peripheral.getName(backpack) or nil
 
-local gear_tl = peripheral.wrap("Create_RotationSpeedController_11")
-local gear_tr = peripheral.wrap("Create_RotationSpeedController_12")
-local gear_bl = peripheral.wrap("Create_RotationSpeedController_14")
-local gear_br = peripheral.wrap("Create_RotationSpeedController_15")
+-- SETTINGS
+local PITCH_OVER_H  = 80    -- climb 80 blocks vertically before turning
+local CRUISE_Y      = 140   -- safe cruise altitude
+local MAX_SAFE_Y    = 170   -- hard ceiling
+local DIVE_DIST     = 450   -- distance N to pitch nose straight into target
+local DETONATE_DIST = 50    -- warhead trigger radius
 
-local gear_go = peripheral.wrap("Create_RotationSpeedController_13")
+local SIGN_TURN     = 1
+local SIGN_TILT     = -1
+local SIGN_ROLL     = 1
 
+local KP_TURN       = 0.003
+local KD_TURN       = 0.01
+local KP_TILT       = 0.008
+local KD_TILT       = 0.0085
+local MAX_VEC       = 0.28
 
-local monitor_main = peripheral.wrap("monitor_1")
-local height_sensor = peripheral.find("altitude_sensor")
-local speed_sensor = peripheral.find("velocity_sensor")
-local stress_sensor = peripheral.find("Create_Stressometer")
+local function clamp(v, minV, maxV)
+    return math.max(minV, math.min(maxV, v))
+end
 
-local x_ang
-local z_ang
+local function wrap180(a)
+    while a >  180 do a = a - 360 end
+    while a < -180 do a = a + 360 end
+    return a
+end
 
-local tr_boost
-local tl_boost   
+-- INIT
+thruster.setThrustNormalized(0)
+thruster.setVector(0, 0)
+if bpName then thruster.pullFluid(bpName) end
 
-local br_boost
-local bl_boost
+local tx, ty, tz
+print("Waiting for disk...")
 
-local acceleration = 0
-local go_boost = 0
-
-local last_error_x = 0
-local last_error_z = 0
-
-
-local Kp_x = 0.19
-local Kp_z = 1
-local Ki_x = 0.3
-local Ki_z = 0.5
-local kd_x = 0.7
-local Kd_z = 0.2
-
-local p_x = 0
-local p_z = 0
-local i_x = 0
-local i_z = 0
-local d_x = 0
-local d_z = 0
-
-local out_x
-local out_z
-
-local corr_pitch
-local corr_roll
-
-local speed = 0
-local messedge_fuel = "fetching fuel"
-local old_message
-local sender_fuel
-
-local stress_capacity
-local stress
-local stress_buf
-local col
-
-local myID = os.getComputerID()
-print(myID)
-
-
-local function updateDisplay()
-    monitor_main.clear()
-    monitor_main.setCursorPos(1, 1)
-    monitor_main.setTextScale(0.5)
-    
-    -- Строка 1: тяга и углы стабилизации
-    monitor_main.setTextColor(colors.yellow)
-    monitor_main.write(string.format("T:%3d", acceleration))
-
-    monitor_main.write(" GO:")
-    monitor_main.write(string.format("%3d", go_boost))
-
-    monitor_main.setTextColor(colors.lightBlue)
-    monitor_main.setCursorPos(45, 1)
-    monitor_main.write("Fuel time:")
-    monitor_main.setCursorPos(45, 2)
-    if messedge_fuel == "fetching fuel" then
-        col = colors.orange
-    else
-        col = colors.green
+while not tx or not ty or not tz do
+    if fs.exists("disk/target.txt") then
+        local f = fs.open("disk/target.txt", "r")
+        if f then
+            tx = tonumber(f.readLine())
+            ty = tonumber(f.readLine())
+            tz = tonumber(f.readLine())
+            f.close()
+        end
     end
-    monitor_main.setTextColor(col)
-    monitor_main.write(messedge_fuel)
-
-
-    monitor_main.setTextColor(colors.lightBlue)
-    monitor_main.setCursorPos(25, 1)
-    monitor_main.write("Power usage:")
-    monitor_main.setCursorPos(25, 2)
-    if stress_buf <= 0.2 then
-        col = colors.green
-    elseif stress_buf <= 0.4 then
-        col = colors.lime
-    elseif stress_buf <= 0.6 then
-        col = colors.yellow
-    elseif stress_buf <= 0.8 then
-        col = colors.orange
-    elseif stress_buf <= 1.0 then
-        col = colors.red
+    if not tx or not ty or not tz then
+        sleep(0.5)
     end
-    monitor_main.setTextColor(col)
-    monitor_main.write(string.format("%d", stress))
-    monitor_main.setTextColor(colors.lightGray)
-    monitor_main.write(string.format("/"))
-    monitor_main.setTextColor(colors.white)
-    monitor_main.write(string.format("%d", stress_capacity))
-    monitor_main.setTextColor(col)
-    monitor_main.write(string.format("   %d", stress_buf * 100))
-    monitor_main.setTextColor(colors.lightGray)
-    monitor_main.write("%")
-  
-
-
-
-    
-    --monitor_main.setTextColor(colors.gray)
-    --monitor_main.write(" | ")
-    --
-    --monitor_main.setTextColor(colors.green)
-    --monitor_main.write(string.format("P:%3d", corr_pitch))
-    --
-    --monitor_main.setTextColor(colors.gray)
-    --monitor_main.write(" ")
-    --
-    --monitor_main.setTextColor(colors.cyan)
-    --monitor_main.write(string.format("R:%3d", corr_roll))
-    
-    -- Строка 2: PID вывод (X и Z)
-    monitor_main.setCursorPos(1, 2)
-    monitor_main.setTextColor(colors.lightGray)
-    monitor_main.write("PID")
-    monitor_main.setTextColor(colors.gray)
-    monitor_main.write(" X")
-    monitor_main.setTextColor(colors.white)
-    monitor_main.write(string.format("%3d", out_x))
-    monitor_main.setTextColor(colors.gray)
-    monitor_main.write(" Z")
-    monitor_main.setTextColor(colors.white)
-    monitor_main.write(string.format("%3d", out_z))
-    
-    -- Строка 3: моторы (кратко)
-    monitor_main.setCursorPos(1, 3)
-    --monitor_main.setTextColor(colors.lime)
-    --monitor_main.write("TL")
-    --monitor_main.setTextColor(colors.white)
-    --monitor_main.write(string.format("%3d", tl_boost))
-    --monitor_main.setTextColor(colors.gray)
-    --monitor_main.write(" TR")
-    --monitor_main.setTextColor(colors.white)
-    --monitor_main.write(string.format("%3d", tr_boost))
-    --monitor_main.setTextColor(colors.gray)
-    --monitor_main.write(" BL")
-    --monitor_main.setTextColor(colors.white)
-    --monitor_main.write(string.format("%3d", bl_boost))
-    --monitor_main.setTextColor(colors.gray)
-    --monitor_main.write(" BR")
-    --monitor_main.setTextColor(colors.white)
-    --monitor_main.write(string.format("%3d", br_boost))
-
-
-    monitor_main.setCursorPos(1, 4)
-    monitor_main.setTextColor(colors.white)
-    monitor_main.write(string.format("%.1d", speed  * 3,6))
-    monitor_main.setTextColor(colors.cyan)
-    monitor_main.write(" km/h")
-
-    monitor_main.setCursorPos(1, 10)
-    monitor_main.write("_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_")
-
-    
 end
 
 
-acceleration = gear_tl.getTargetSpeed()
-rednet.open("right")
+sensor.setTarget(tx, ty, tz)
+
+local logFile = fs.open("flight_log.txt", "w")
+if logFile then
+    logFile.writeLine(string.format("=== VELOCITY-HEADING LOG | TARGET: %.1f, %.1f, %.1f ===", tx, ty, tz))
+    logFile.flush()
+end
+
+print("Launch in 3s...")
+sleep(3)
+
+local reachedCruise = false
+local startY = sensor.getCoordinates().y or 0
+local startTime = os.clock()
+local tick = 0
+local diveRollLock = nil
+local prevDist = 999999
 
 while true do
+    tick = tick + 1
+    local t = os.clock() - startTime
+    if bpName then thruster.pullFluid(bpName) end
 
-    if math.abs(acceleration) <= 80 then
-        acceleration = acceleration + (redstone_1.getAnalogInput("top") / 3) - (redstone_1.getAnalogInput("bottom") / 3)
+    local all   = sensor.getAll()
+    local pos   = all.position
+    local tgt   = all.target
+    local vel   = all.velocity
+    local ang   = all.gimbal
+    local press = all.airPressure or 1.0
 
-    else
-        acceleration = acceleration + (redstone_1.getAnalogInput("top") / 15) - (redstone_1.getAnalogInput("bottom") / 15)
+    local x, y, z     = pos.x, pos.y, pos.z
+    local vx, vy, vz  = vel.x or 0, vel.y or 0, vel.z or 0
+    local spd         = vel.speed or 0
+    local gSpd        = math.sqrt(vx * vx + vz * vz)
+    local hDist       = tgt.horizontalDistance
+    local dist        = tgt.distance
 
-    end
+    local pitchDeg    = math.abs(ang.pitch or 0)
+    local rollDeg     = ang.roll or 0
+    local pRate       = clamp(ang.pitchRate or 0, -180, 180)
+    local yRate       = clamp(ang.yawRate or 0, -180, 180)
 
-    go_boost = go_boost + (redstone_1.getAnalogInput("right") / 3) - (redstone_1.getAnalogInput("left") / 3)
+    local targetBrg   = math.deg(math.atan2(tx - x, -(tz - z)))
+    local actualHdg   = gSpd > 4.0 and math.deg(math.atan2(vx, -vz)) or targetBrg
+    local relAngle    = wrap180(targetBrg - actualHdg)
 
-    if redstone_1.getInput("back") then
-        go_boost = 0
-    end
+    -- DETONATION (direct hit OR closest-approach proximity fuse within 22 blocks)
+    local closestApproach = (dist < 22.0 and dist > prevDist)
+    prevDist = dist
 
-    gear_go.setTargetSpeed(go_boost)
-
-    local angles = sensor.getAngles()
-
-    for key, value in pairs(angles) do
-        if key == 1 then
-            x_ang = math.floor(value / 1)
-        else
-            z_ang = math.floor(value / 1)
+    if dist <= DETONATE_DIST or closestApproach then
+        if logFile then
+            logFile.writeLine(string.format("EVENT: DETONATE at Pos:(%.1f,%.1f,%.1f) Dist:%.2f", x, y, z, dist))
+            logFile.close()
         end
+        print("BOOM! Dist: " .. string.format("%.1f", dist))
+        if bus then bus.setChannel(1, 15) end
+        thruster.setVector(0, 0)
+        thruster.setThrustNormalized(0)
+        break
+    end
+    if t > 8.0 and spd < 0.8 then
+        if logFile then
+            logFile.writeLine(string.format("EVENT: STOPPED at Pos:(%.1f,%.1f,%.1f) Dist:%.1f", x, y, z, dist))
+            logFile.close()
+        end
+        print("STOPPED!")
+        thruster.setVector(0, 0)
+        thruster.setThrustNormalized(0)
+        break
     end
 
-    if acceleration == 0 then
-        p_x, p_z, i_x, i_z, d_x, d_z = 0, 0, 0, 0, 0, 0
+    -- ============================================================
+    -- 1. FLIGHT PHASE & DESIRED PITCH
+    -- ============================================================
+    if y >= startY + PITCH_OVER_H then
+        reachedCruise = true
+    end
+
+    local phase = "CLIMB"
+    local desPitch = 0
+    local turnErr  = 0
+    local thrust   = 0.88
+    local curKpTurn  = KP_TURN
+    local curKdTurn  = KD_TURN
+    local curKpTilt  = KP_TILT
+    local curKdTilt  = KD_TILT
+    local curMaxTurn = MAX_VEC
+
+    if not reachedCruise then
+        phase = "CLIMB"
+        desPitch = 0
+        turnErr  = 0
+        thrust   = 1.0
+
+    elseif hDist > DIVE_DIST then
+        phase = "CRUISE"
+        diveRollLock = nil
+        desPitch = clamp(65 - (CRUISE_Y - y) * 0.5 + vy * 0.6, 45, 80)
+        turnErr  = relAngle
+
+        if y >= MAX_SAFE_Y or press < 0.65 then
+            thrust = 0.50
+        elseif y > CRUISE_Y + 6 then
+            thrust = clamp(0.75 - (y - CRUISE_Y) * 0.02 - math.max(0, vy) * 0.02, 0.55, 0.85)
+        elseif y < CRUISE_Y - 6 or vy < -1.5 then
+            thrust = 1.0
+        else
+            thrust = 1.0
+        end
+
     else
-        p_x = Kp_x * x_ang
-        p_z = Kp_z * z_ang
+        phase = "DIVE"
+        -- Lock the exact roll angle at the start of the dive so >90 deg Euler roll flip doesn't invert axes!
+        if diveRollLock == nil then
+            diveRollLock = rollDeg
+        end
 
-        i_x = math.max(-20, math.min(20, i_x + x_ang * 0.1 * Ki_x))
-        i_z = math.max(-20, math.min(20, i_z + z_ang * 0.1 * Ki_z))
+        curKpTurn  = 0.05
+        curKdTurn  = 0.016
+        curMaxTurn = 0.30
+        curKpTilt  = 0.05
+        curKdTilt  = 0.016
 
-        d_x = (x_ang - last_error_x) / kd_x
-        d_z = (z_ang - last_error_z) / Kd_z
+        local heightAboveTgt = y - tgt.y
+        local glideAngle = math.deg(math.atan2(heightAboveTgt, math.max(hDist, 5)))
+        desPitch = 155--clamp(90 + glideAngle, 135, 180)
+        turnErr  = relAngle
+        thrust   = 0.61
     end
 
-    last_error_x = x_ang
-    last_error_z = z_ang
+    -- ============================================================
+    -- 2. WORLD-HORIZON COMMANDS (NO SIGN FLIPS AT 90 DEG)
+    -- ============================================================
+    local tiltErr = desPitch - pitchDeg
 
-    out_x = p_x + i_x + d_x
-    out_z = p_z + i_z + d_z
+    local cmdTurn = clamp((turnErr * curKpTurn - yRate * curKdTurn) * SIGN_TURN, -curMaxTurn, curMaxTurn)
+    local cmdTilt = clamp((tiltErr * curKpTilt + pRate * curKdTilt) * SIGN_TILT, -MAX_VEC, MAX_VEC)
 
-    corr_roll = math.max(-30, math.min(30, out_z))
-    corr_pitch = math.max(-10, math.min(10, out_x))
+    -- ============================================================
+    -- 3. ROTATE COMMANDS BY ROLL ANGLE
+    -- ============================================================
+    local useRoll = (phase == "DIVE" and diveRollLock ~= nil) and diveRollLock or rollDeg
+    local rRad = math.rad(useRoll * SIGN_ROLL)
+    local cr, sr = math.cos(rRad), math.sin(rRad)
 
-    tl_boost = acceleration - corr_pitch + corr_roll
-    tr_boost = acceleration + corr_pitch + corr_roll
-    bl_boost = acceleration - corr_pitch - corr_roll
-    br_boost = acceleration + corr_pitch - corr_roll
-    
-    gear_tl.setTargetSpeed(tl_boost)
-    gear_tr.setTargetSpeed(tr_boost)
-    gear_br.setTargetSpeed(br_boost)
-    gear_bl.setTargetSpeed(bl_boost)
+    local vec1 = clamp(cmdTurn * cr - cmdTilt * sr, -MAX_VEC, MAX_VEC)
+    local vec2 = clamp(cmdTurn * sr + cmdTilt * cr, -MAX_VEC, MAX_VEC)
 
-    speed = speed_sensor.getVelocity()
+    thruster.setThrustNormalized(thrust)
+    thruster.setVector(-vec1, -vec2)
 
-    
-    old_message = messedge_fuel
-    sender_fuel, messedge_fuel = rednet.receive(0.01)
-    if messedge_fuel == nil then
-        messedge_fuel = old_message
+    -- ============================================================
+    -- 4. LOG EVERY TICK
+    -- ============================================================
+    if logFile then
+        logFile.writeLine(string.format(
+            "[T:%d | %.2fs | %s] Pos:(%.1f,%.1f,%.1f) Dist:%.0f hDist:%.0f | " ..
+            "Vel:(%.1f,%.1f,%.1f) Spd:%.1f | Pit:%.1f/%.1f TgtBrg:%.1f ActHdg:%.1f RelAng:%.1f Rol:%.1f | " ..
+            "cmdTurn:%.3f cmdTilt:%.3f | Thr:%.2f Vec:(%.3f,%.3f)",
+            tick, t, phase, x, y, z, dist, hDist,
+            vx, vy, vz, spd, pitchDeg, desPitch, targetBrg, actualHdg, relAngle, rollDeg,
+            cmdTurn, cmdTilt, thrust, vec1, vec2
+        ))
+        logFile.flush()
     end
 
-    stress_capacity = stress_sensor.getStressCapacity()
-    stress = stress_sensor.getStress()
-    stress_buf = stress / stress_capacity
+    term.clear()
+    term.setCursorPos(1, 1)
+    print(string.format("[%s] Y:%.0f/%d D:%.0f", phase, y, CRUISE_Y, dist))
+    print(string.format("Pit:%.0f/%.0f Rel:%.0f Rol:%.0f", pitchDeg, desPitch, relAngle, rollDeg))
+    print(string.format("Vec:(%.2f,%.2f) Thr:%.2f", vec1, vec2, thrust))
 
-    updateDisplay()
-    
+    sleep(0.05)
+end
+
+if logFile then
+    logFile.close()
 end
